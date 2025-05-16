@@ -1,8 +1,7 @@
 import asyncio
 import random
 
-from grader.tcputils import *
-
+from tcputils import *
 
 class Servidor:
     def __init__(self, rede, porta):
@@ -62,8 +61,8 @@ class Conexao:
 
         #cabeçaljo
         flags = FLAGS_SYN | FLAGS_ACK
-        header = make_header(self.src_port, self.dst_port, self.seq_no, self.ack_no, flags)
-        segment = fix_checksum(header, self.src_addr, self.dst_addr)
+        header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, flags)
+        segment = fix_checksum(header, self.dst_addr, self.src_addr)
 
         #Enviando SYN+ACK
         self.servidor.rede.enviar(segment, self.src_addr)
@@ -84,8 +83,8 @@ class Conexao:
 
         # Enviar ACK
         flags_ack = FLAGS_ACK
-        header = make_header(self.src_port, self.dst_port, self.seq_no, self.ack_no, flags_ack)
-        segmento_ack = fix_checksum(header, self.src_addr, self.dst_addr)
+        header = make_header(self.dst_port,self.src_port, self.seq_no, self.ack_no, flags_ack)
+        segmento_ack = fix_checksum(header, self.dst_addr, self.src_addr)
         self.servidor.rede.enviar(segmento_ack, self.src_addr)
 
         print('recebido payload: %r' % payload)
