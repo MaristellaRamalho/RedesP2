@@ -1,5 +1,7 @@
 import asyncio
-from tcputils import *
+import random
+
+from grader.tcputils import *
 
 
 class Servidor:
@@ -55,7 +57,7 @@ class Conexao:
         self.src_addr, self.src_port, self.dst_addr, self.dst_port = id_conexao
 
         #setando números de sequencia
-        self.seq_no = 150
+        self.seq_no = random.randint(0, 0xffff)
         self.ack_no = seq_no_cliente + 1
 
         #cabeçaljo
@@ -74,6 +76,18 @@ class Conexao:
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
+        if seq_no == self.ack_no:
+            self.ack_no += len(payload)
+
+            if payload and self.callback:
+                self.callback(self, payload)
+
+        # Enviar ACK
+        flags_ack = FLAGS_ACK
+        header = make_header(self.src_port, self.dst_port, self.seq_no, self.ack_no, flags_ack)
+        segmento_ack = fix_checksum(header, self.src_addr, self.dst_addr)
+        self.servidor.rede.enviar(segmento_ack, self.src_addr)
+
         print('recebido payload: %r' % payload)
 
     # Os métodos abaixo fazem parte da API
