@@ -38,11 +38,16 @@ class Servidor:
                   (src_addr, src_port, dst_addr, dst_port))
 
 class Conexao:
+    TIMEOUT = 1
+
     def __init__(self, servidor, id_conexao, seq_no_cliente):
         self.servidor = servidor
         self.id_conexao = id_conexao
         self.callback = None
         self.estado = 'ABERTA'
+        #PASSO5
+        self.timer = None
+        self.segments_nao_confirmados = [] #[(seq_no, segment)]
         
         #PASSO1
         
@@ -62,11 +67,28 @@ class Conexao:
         self.servidor.rede.enviar(segment, self.src_addr)
         self.seq_no += 1
 
+    def _iniciar_timer(self):
+        self._cancelar_timer()
+        self.timer = asyncio.get_event_loop().call_later(self.TIMEOUT, self._timeout)
+    
+    def _cancelar_timer(self):
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+
+    def _timeout(self):
+        if self.segments_nao_confirmados:
+            #retransmitir primeiro segmento não confirmado
+            _, segment = self.segments_nao_confirmados[0] #ignora seq_no
+            self.servidor.rede.enviar(segment, self.src_addr)
+            self._iniciar_timer()
+
+
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         if self.estado == 'FECHADA':
             return
 
-        if (flags & FLAGS_FIN) == FLAGS_FIN: #PASSO4
+        if (flags & FLAGS_FIN) == FLAGS_FIN: #PASSO4 (cliente enviou FIN)
             self.ack_no = seq_no + 1
             header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segment = fix_checksum(header, self.dst_addr, self.src_addr)
@@ -78,6 +100,23 @@ class Conexao:
             self.estado = 'FECHANDO'
             return
 
+        #controle de retransmissao
+        cabecalho = 4 * (flags >> 12) 
+        if (flags & FLAGS_ACK) == FLAGS_ACK:
+            novos_segments_nao_confirmados = []
+            ack_avancou = False
+            for seq, segment in self.segments_nao_confirmados:
+                if seq + len(segment[cabecalho:]) <= ack_no:
+                    ack_avancou = True
+                    continue 
+                novos_segments_nao_confirmados.append((seq, segment))
+
+            if ack_avancou:
+                self.segments_nao_confirmados = novos_segments_nao_confirmados
+                self._cancelar_timer()
+                if self.segments_nao_confirmados:
+                    self._iniciar_timer()
+
         if self.estado == 'FECHANDO':
             if payload:
                 return
@@ -85,7 +124,7 @@ class Conexao:
                 self.estado = 'FECHADA'
             return
 
-        if seq_no == self.ack_no and self.estado == 'ABERTA': #PASSO2
+        if seq_no == self.ack_no and self.estado == 'ABERTA': #PASSO2 (recebendo dados)
             if payload:
                 self.ack_no += len(payload)
                 if self.callback:
@@ -104,6 +143,12 @@ class Conexao:
             header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segment = fix_checksum(header + pedaco, self.dst_addr, self.src_addr)
             self.servidor.rede.enviar(segment, self.src_addr)
+
+            #PASSO5
+            self.segments_nao_confirmados.append((self.seq_no, segment))
+            if len(self.segments_nao_confirmados) == 1:
+                self._iniciar_timer()
+
             self.seq_no += len(pedaco)
 
     def fechar(self):
