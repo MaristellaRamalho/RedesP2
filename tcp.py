@@ -1,7 +1,8 @@
+
+
 import asyncio
 import random
 import time  
-
 from tcputils import *
 
 class Servidor:
@@ -39,71 +40,76 @@ class Servidor:
                   (src_addr, src_port, dst_addr, dst_port))
 
 class Conexao:
-
     def __init__(self, servidor, id_conexao, seq_no_cliente):
         self.servidor = servidor
         self.id_conexao = id_conexao
         self.callback = None
         self.estado = 'ABERTA'
-        #PASSO5
+        
+        # Controle de transmissão
         self.timer = None
-        self.segments_nao_confirmados = [] #[(seq_no, segment, tempo_envio)]
+        self.segments_nao_confirmados = []  # [(seq_no, segment, tempo_envio)]
         self.buffer_envio = b''
         self.enviando = False
 
-
-        #PASSO6
-        self.estimated_rtt = 1.0
-        self.dev_rtt = 0.5
+        # Controle de RTT (Passo 6)
+        self.estimated_rtt = None
+        self.dev_rtt = None
         self.alpha = 0.125
         self.beta = 0.25
-        self.TIMEOUT = 1
 
-        #PASSO1
+        # Controle de congestionamento (Passo 7)
+        self.cwnd = 1 * MSS
+        self.ssthresh = 65535  # Valor inicial alto
+        self.duplicate_acks = 0
+        self.last_ack = None  # Último ACK recebido
 
-        #desempacotando conexao
+        # Estabelecimento de conexão (Passo 1)
         self.src_addr, self.src_port, self.dst_addr, self.dst_port = id_conexao
-
-        #setando números de sequência
         self.seq_no = random.randint(0, 0xffff)
         self.ack_no = seq_no_cliente + 1
 
-        #cabeçaljo
+        # Envia SYN+ACK
         flags = FLAGS_SYN | FLAGS_ACK
         header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, flags)
         segment = fix_checksum(header, self.dst_addr, self.src_addr)
-
-        #Enviando SYN+ACK
         self.servidor.rede.enviar(segment, self.src_addr)
         self.seq_no += 1
 
     def _iniciar_timer(self):
         self._cancelar_timer()
-        self.TIMEOUT = self._timeout_interval()
-        self.timer = asyncio.get_event_loop().call_later(self.TIMEOUT, self._timeout)
+        timeout = self._timeout_interval()
+        loop = asyncio.get_event_loop()
+        self.timer = loop.call_later(timeout, self._timeout)
     
     def _cancelar_timer(self):
         if self.timer:
             self.timer.cancel()
             self.timer = None
-
+    
     def _timeout(self):
+        """Trata timeout com redução da janela de congestionamento"""
+        self._atualizar_janela_congest(False)
         if self.segments_nao_confirmados:
-            #retransmitir primeiro segmento não confirmado
-            seq_no, segment, _  = self.segments_nao_confirmados[0] #ignora tempo_envio
+            # Retransmite o primeiro segmento não confirmado
+            seq_no, segment, _ = self.segments_nao_confirmados[0]
             self.servidor.rede.enviar(segment, self.src_addr)
+            # Marca como retransmitido (não usará para cálculo RTT)
             self.segments_nao_confirmados[0] = (seq_no, segment, None)
             self._iniciar_timer()
 
-    # PASSO6: calcula o timeout baseado no RTT estimado e no desvio
     def _timeout_interval(self):
-        return self.estimated_rtt + 4 * self.dev_rtt
+        """Calcula o timeout baseado no RTT estimado e no desvio"""
+        if self.estimated_rtt is None:
+            return 1.0  # Valor padrão inicial
+        return max(0.1, self.estimated_rtt + 4 * self.dev_rtt)  # Mínimo de 100ms
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         if self.estado == 'FECHADA':
             return
 
-        if (flags & FLAGS_FIN) == FLAGS_FIN: #PASSO4 (cliente enviou FIN)
+        # Tratamento de FIN (Passo 4)
+        if (flags & FLAGS_FIN) == FLAGS_FIN:
             self.ack_no = seq_no + 1
             header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segment = fix_checksum(header, self.dst_addr, self.src_addr)
@@ -115,102 +121,121 @@ class Conexao:
             self.estado = 'FECHANDO'
             return
 
-        #controle de retransmissao
-        cabecalho = 4 * (flags >> 12) 
+        # Tratamento de ACKs (Passo 2, 5, 6, 7)
+        cabecalho = 4 * (flags >> 12)
         if (flags & FLAGS_ACK) == FLAGS_ACK:
-            novos_segments_nao_confirmados = []
+            # Controle de ACKs duplicados (Fast Retransmit)
+            if ack_no == self.last_ack:
+                self.duplicate_acks += 1
+                if self.duplicate_acks == 3:
+                    self._fast_retransmit()
+            else:
+                self.duplicate_acks = 0
+                self.last_ack = ack_no
+
+            # Processa segmentos confirmados
+            novos_segments = []
             ack_avancou = False
             for seq, segment, tempo_envio in self.segments_nao_confirmados:
                 if seq + len(segment[cabecalho:]) <= ack_no:
                     ack_avancou = True
-
-                    #PASSO6
+                    # Atualiza RTT (Passo 6)
                     if tempo_envio is not None:
-                        sample_rtt = time.time() - tempo_envio
-                        if self.estimated_rtt == 1.0 and self.dev_rtt == 0.5:
-                            self.estimated_rtt = sample_rtt
-                            self.dev_rtt = sample_rtt / 2
-                        else:
-                            self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
-                            self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
-                            
-                    continue 
-                novos_segments_nao_confirmados.append((seq, segment, tempo_envio))
+                        self._atualizar_rtt(time.time() - tempo_envio)
+                else:
+                    novos_segments.append((seq, segment, tempo_envio))
 
             if ack_avancou:
-                self.segments_nao_confirmados = novos_segments_nao_confirmados
+                self.segments_nao_confirmados = novos_segments
                 self._cancelar_timer()
                 if self.segments_nao_confirmados:
                     self._iniciar_timer()
                 else:
                     self.enviando = False
+                    self._atualizar_janela_congest(True)
+                self._tentar_enviar()
 
-                    if self.buffer_envio:
-                        pedaco = self.buffer_envio[:MSS]
-                        self.buffer_envio = self.buffer_envio[MSS:]
+        # Tratamento de dados recebidos (Passo 2)
+        if seq_no == self.ack_no and self.estado == 'ABERTA' and payload:
+            self.ack_no += len(payload)
+            if self.callback:
+                self.callback(self, payload)
+            header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, FLAGS_ACK)
+            segment = fix_checksum(header, self.dst_addr, self.src_addr)
+            self.servidor.rede.enviar(segment, self.src_addr)
 
-                        header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, FLAGS_ACK)
-                        segment = fix_checksum(header + pedaco, self.dst_addr, self.src_addr)
-                        self.servidor.rede.enviar(segment, self.src_addr)
+        # Finalização de conexão
+        if self.estado == 'FECHANDO' and (flags & FLAGS_ACK) == FLAGS_ACK and ack_no == self.seq_no:
+            self.estado = 'FECHADA'
 
-                        tempo_envio = time.time()
-                        self.segments_nao_confirmados.append((self.seq_no, segment, tempo_envio))
-                        self._iniciar_timer()
-                        self.enviando = True    
+    def _atualizar_rtt(self, sample_rtt):
+        """Atualiza as estimativas de RTT (Passo 6)"""
+        if self.estimated_rtt is None:
+            # Primeira medição
+            self.estimated_rtt = sample_rtt
+            self.dev_rtt = sample_rtt / 2
+        else:
+            # Atualizações subsequentes
+            self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
+            self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
+    
+    def _atualizar_janela_congest(self, ack_recebido):
+        """Atualiza a janela de congestionamento (Passo 7)"""
+        if ack_recebido:
+            # Slow Start ou Congestion Avoidance
+            if self.cwnd < self.ssthresh:
+                self.cwnd += MSS  # Slow Start
+            else:
+                self.cwnd += MSS * MSS / self.cwnd  # Congestion Avoidance
+        else:
+            # Timeout ou Fast Retransmit
+            self.ssthresh = max(self.cwnd // 2, 2 * MSS)
+            self.cwnd = MSS
 
-                        self.seq_no += len(pedaco)
+    def _fast_retransmit(self):
+        """Implementa Fast Retransmit (Passo 7)"""
+        if self.segments_nao_confirmados:
+            self._atualizar_janela_congest(False)
+            seq, segment, _ = self.segments_nao_confirmados[0]
+            self.servidor.rede.enviar(segment, self.src_addr)
+            self.duplicate_acks = 0
+            self._cancelar_timer()
+            self._iniciar_timer()
 
-        if self.estado == 'FECHANDO':
-            if payload:
-                return
-            if (flags & FLAGS_ACK) == FLAGS_ACK and ack_no == self.seq_no:
-                self.estado = 'FECHADA'
-            return
-
-        if seq_no == self.ack_no and self.estado == 'ABERTA': #PASSO2 (recebendo dados)
-            if payload:
-                self.ack_no += len(payload)
-                if self.callback:
-                    self.callback(self, payload)
-                header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, FLAGS_ACK)
-                segment = fix_checksum(header, self.dst_addr, self.src_addr)
-                self.servidor.rede.enviar(segment, self.src_addr)
-   
-
+    # Métodos restantes permanecem iguais
     def registrar_recebedor(self, callback):
         self.callback = callback
 
     def enviar(self, dados):
         self.buffer_envio += dados
+        if not self.enviando:
+            self._tentar_enviar()
 
-        # Só envia se nada estiver pendente
-        if self.enviando or not self.buffer_envio:
-            return
+    def _tentar_enviar(self):
+        bytes_nao_confirmados = sum(
+            len(segment[4*(segment[12]>>12):]) 
+            for _, segment, _ in self.segments_nao_confirmados
+        )
 
-        pedaco = self.buffer_envio[:MSS]
-        self.buffer_envio = self.buffer_envio[MSS:]
+        while self.buffer_envio and bytes_nao_confirmados < self.cwnd:
+            pedaco = self.buffer_envio[:MSS]
+            self.buffer_envio = self.buffer_envio[MSS:]
 
-        header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, FLAGS_ACK)
-        segment = fix_checksum(header + pedaco, self.dst_addr, self.src_addr)
-        self.servidor.rede.enviar(segment, self.src_addr)
-        
-        tempo_envio = time.time()
-        
-        self.segments_nao_confirmados.append((self.seq_no, segment, tempo_envio))
-        self._iniciar_timer()
-        self.enviando = True
+            header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, FLAGS_ACK)
+            segment = fix_checksum(header + pedaco, self.dst_addr, self.src_addr)
+            self.servidor.rede.enviar(segment, self.src_addr)
 
-        self.seq_no += len(pedaco)
-
+            self.segments_nao_confirmados.append((self.seq_no, segment, time.time()))
+            self._iniciar_timer()
+            self.enviando = True
+            self.seq_no += len(pedaco)
+            bytes_nao_confirmados += len(pedaco)
 
     def fechar(self):
-        #PASSO4
-        if self.estado == 'FECHADA':
-            return
-
-        flags = FLAGS_FIN | FLAGS_ACK
-        header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, flags)
-        segment = fix_checksum(header, self.dst_addr, self.src_addr)
-        self.servidor.rede.enviar(segment, self.src_addr)
-        self.seq_no += 1
-        self.estado = 'FECHANDO'
+        if self.estado != 'FECHADA':
+            flags = FLAGS_FIN | FLAGS_ACK
+            header = make_header(self.dst_port, self.src_port, self.seq_no, self.ack_no, flags)
+            segment = fix_checksum(header, self.dst_addr, self.src_addr)
+            self.servidor.rede.enviar(segment, self.src_addr)
+            self.seq_no += 1
+            self.estado = 'FECHANDO'
